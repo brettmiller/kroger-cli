@@ -12,8 +12,13 @@ class KrogerAPI:
     browser_options = {
         'headless': True,
         'userDataDir': '.user-data',
-        'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
-                 '--no-sandbox']
+        'args': ['--no-sandbox',
+                 '--disable-dev-shm-usage',
+                 '--disable-blink-features=AutomationControlled',  # Hide automation detection
+                 '--exclude-switches=enable-automation',  # Remove automation switches
+                 '--disable-extensions-except',  # Disable extension detection
+                 '--disable-plugins-discovery',  # Disable plugin discovery
+                 '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36']
     }
     headers = {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -27,25 +32,32 @@ class KrogerAPI:
     def complete_survey(self):
         # Cannot use headless mode here for some reason (sign-in cookie doesn't stick)
         self.browser_options['headless'] = False
-        res = asyncio.get_event_loop().run_until_complete(self._complete_survey())
+        res = asyncio.run(self._complete_survey())
         self.browser_options['headless'] = True
 
         return res
 
     @memoized
     def get_account_info(self):
-        return asyncio.get_event_loop().run_until_complete(self._get_account_info())
+        return asyncio.run(self._get_account_info())
 
     @memoized
     def get_points_balance(self):
-        return asyncio.get_event_loop().run_until_complete(self._get_points_balance())
+        return asyncio.run(self._get_points_balance())
 
     def clip_coupons(self):
-        return asyncio.get_event_loop().run_until_complete(self._clip_coupons())
+        # Force non-headless mode for clip_coupons since Azure AD B2C has issues in headless mode
+        original_headless = self.browser_options['headless']
+        self.browser_options['headless'] = False
+        try:
+            result = asyncio.run(self._clip_coupons())
+        finally:
+            self.browser_options['headless'] = original_headless
+        return result
 
     @memoized
     def get_purchases_summary(self):
-        return asyncio.get_event_loop().run_until_complete(self._get_purchases_summary())
+        return asyncio.run(self._get_purchases_summary())
 
     async def _retrieve_feedback_url(self):
         self.cli.console.print('Loading `My Purchases` page (to retrieve the Feedback’s Entry ID)')
@@ -172,31 +184,125 @@ class KrogerAPI:
         return balance
 
     async def _clip_coupons(self):
-        signed_in = await self.sign_in_routine(redirect_url='/cl/coupons/', contains=['Coupons Clipped'])
+        # Use a more generic check for the coupons page
+        signed_in = await self.sign_in_routine(redirect_url='/savings/cl/coupons/', contains=['coupon'])
         if not signed_in:
             await self.destroy()
             return None
 
-        js = """
-            window.scrollTo(0, document.body.scrollHeight);
-            for (let i = 0; i < 150; i++) {
-                let el = document.getElementsByClassName('kds-Button--favorable')[i];
-                if (el !== undefined) {
-                    el.scrollIntoView();
-                    el.click();
-                }
-            }
-        """
-
-        self.cli.console.print('[italic]Applying the coupons, please wait..[/italic]')
-        await self.page.keyboard.press('Escape')
-        for i in range(6):
-            await self.page.evaluate(js)
-            await self.page.keyboard.press('End')
-            await self.page.waitFor(1000)
+        # Wait for page to fully load
         await self.page.waitFor(3000)
+
+        self.cli.console.print('[italic]Searching for available coupons to clip...[/italic]')
+        
+        try:
+            # First, scroll through the entire page to load all lazy-loaded coupons
+            self.cli.console.print('[blue]Scrolling through page to load all coupons...[/blue]')
+            
+            # Get initial page height
+            last_height = await self.page.evaluate('document.body.scrollHeight')
+            
+            while True:
+                # Scroll to bottom
+                await self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                
+                # Wait for new content to load
+                await self.page.waitFor(750)  # Wait for lazy loading
+                
+                # Calculate new scroll height and compare with last scroll height
+                new_height = await self.page.evaluate('document.body.scrollHeight')
+                
+                if new_height == last_height:
+                    break  # No more content to load
+                    
+                last_height = new_height
+                self.cli.console.print('[blue]Loading more coupons...[/blue]')
+            
+            self.cli.console.print('[blue]Finished loading all coupons, starting to clip...[/blue]')
+            
+            # Now find all coupon buttons
+            coupon_buttons = await self.page.querySelectorAll('button[data-testid^="CouponActionButton-"]')
+            self.cli.console.print(f'[blue]Found {len(coupon_buttons)} total coupon buttons[/blue]')
+            
+            # First pass: collect all clippable buttons and their test IDs
+            clippable_buttons = []
+            
+            for i, button in enumerate(coupon_buttons):
+                try:
+                    # Get button text to check if it's clippable
+                    button_text = await self.page.evaluate('(element) => element.textContent.trim()', button)
+                    
+                    if button_text.lower().strip() == "clip":
+                        # Get the data-testid for later verification
+                        testid = await self.page.evaluate('(element) => element.getAttribute("data-testid")', button)
+                        clippable_buttons.append((button, testid, i+1))
+                        print(f"Found clippable coupon {i+1}")
+                    else:
+                        print(f"Skipping coupon {i+1} (text: '{button_text}')")
+                        
+                except Exception as e:
+                    print(f"✗ Error checking coupon {i+1}: {e}")
+            
+            if not clippable_buttons:
+                self.cli.console.print('[yellow]No coupons to clip on this page[/yellow]')
+                clipped_count = 0
+            else:
+                self.cli.console.print(f'[blue]Clicking {len(clippable_buttons)} coupons rapidly...[/blue]')
+                
+                # Second pass: click all clippable buttons rapidly
+                clicked_testids = []
+                for button, testid, coupon_num in clippable_buttons:
+                    try:
+                        await button.click()
+                        clicked_testids.append((testid, coupon_num))
+                        print(f"Clicked coupon {coupon_num}")
+                        # Small delay to avoid overwhelming the server
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        print(f"✗ Error clicking coupon {coupon_num}: {e}")
+                
+                # Third pass: wait a bit and then verify all clicks
+                self.cli.console.print('[blue]Waiting for coupons to update...[/blue]')
+                await asyncio.sleep(3)  # Give time for all the async updates to complete
+                
+                clipped_count = 0
+                self.cli.console.print('[blue]Verifying coupon clips...[/blue]')
+                
+                for testid, coupon_num in clicked_testids:
+                    try:
+                        # Find the button again to check its updated state
+                        updated_button = await self.page.querySelector(f'button[data-testid="{testid}"]')
+                        
+                        if updated_button:
+                            updated_text = await self.page.evaluate('(element) => element.textContent.trim()', updated_button)
+                            if updated_text.lower().strip() == "unclip":
+                                print(f"✓ Successfully clipped coupon {coupon_num}")
+                                clipped_count += 1
+                            else:
+                                print(f"✗ Failed to clip coupon {coupon_num} (text: {updated_text})")
+                        else:
+                            # Button not found - might have been removed, assume success
+                            print(f"✓ Coupon {coupon_num} likely clipped (button no longer found)")
+                            clipped_count += 1
+                            
+                    except Exception as verify_error:
+                        print(f"✗ Could not verify coupon {coupon_num}: {verify_error}")
+                
+                self.cli.console.print(f'[blue]Successfully clipped {clipped_count} out of {len(clicked_testids)} attempted coupons[/blue]')
+            
+            failed_count = 0
+                        
+        except Exception as e:
+            self.cli.console.print(f'[red]Error during coupon clipping: {str(e)}[/red]')
+            clipped_count = 0
+        
+        if clipped_count > 0:
+            self.cli.console.print(f'[bold green]Successfully clipped {clipped_count} coupons to your account! 👍[/bold green]')
+        else:
+            self.cli.console.print('[yellow]No new coupons found to clip. All available coupons may already be clipped.[/yellow]')
+                
         await self.destroy()
-        self.cli.console.print('[bold]Coupons successfully clipped to your account! :thumbs_up:[/bold]')
+        return clipped_count
 
     async def _get_purchases_summary(self):
         signed_in = await self.sign_in_routine()
@@ -218,8 +324,31 @@ class KrogerAPI:
     async def init(self):
         self.browser = await launch(self.browser_options)
         self.page = await self.browser.newPage()
+        
+        # Hide automation indicators
+        await self.page.evaluateOnNewDocument('''
+            () => {
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+                
+                // Remove automation detection
+                delete navigator.__proto__.webdriver;
+                
+                // Mock plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+                
+                // Mock languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
+            }
+        ''')
+        
         await self.page.setExtraHTTPHeaders(self.headers)
-        await self.page.setViewport({'width': 700, 'height': 0})
+        await self.page.setViewport({'width': 1366, 'height': 768})  # Common screen resolution
 
     async def destroy(self):
         await self.page.close()
@@ -247,25 +376,194 @@ class KrogerAPI:
         return signed_in
 
     async def sign_in(self, redirect_url, contains):
-        timeout = 20000
+        timeout = 30000  # Increased timeout for complex auth flows
         if not self.browser_options['headless']:
             timeout = 60000
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url)
-        await self.page.click('#SignIn-emailInput', {'clickCount': 3})  # Select all in the field
-        await self.page.type('#SignIn-emailInput', self.cli.username)
-        await self.page.click('#SignIn-passwordInput', {'clickCount': 3})
-        await self.page.type('#SignIn-passwordInput', self.cli.password)
-        await self.page.keyboard.press('Enter')
+        
+        signin_url = 'https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url
+        
+        # Try to navigate to the signin page with retry logic
+        max_retries = 2  # Reduced retries since we already tried direct access
+        for attempt in range(max_retries):
+            try:
+                self.cli.console.print(f'[blue]Loading signin page: {signin_url}[/blue]')
+                
+                # Use very basic navigation with shorter timeout to avoid infinite hangs
+                await self.page.goto(signin_url, {'timeout': 20000})
+                
+                # Wait a bit for any redirects or dynamic content
+                self.cli.console.print('[blue]Waiting for page to fully load...[/blue]')
+                await asyncio.sleep(3)
+                
+                current_url = self.page.url
+                self.cli.console.print(f'[blue]Current URL after navigation: {current_url}[/blue]')
+                
+                # Check if page loaded successfully
+                try:
+                    page_title = await self.page.title()
+                    self.cli.console.print(f'[blue]Page title: {page_title}[/blue]')
+                    
+                    if page_title:
+                        if 'sign' in page_title.lower() or 'login' in page_title.lower():
+                            self.cli.console.print('[green]Authentication page loaded successfully[/green]')
+                            break
+                        elif 'kroger' in page_title.lower():
+                            self.cli.console.print('[green]Kroger page loaded[/green]')
+                            break
+                        else:
+                            self.cli.console.print(f'[yellow]Unexpected page loaded: {page_title}[/yellow]')
+                    else:
+                        self.cli.console.print('[yellow]Could not get page title, but page seems loaded[/yellow]')
+                        break
+                        
+                except Exception as title_e:
+                    self.cli.console.print(f'[yellow]Could not get page title: {str(title_e)}[/yellow]')
+                    # Continue anyway - page might still be functional
+                    break
+                    
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    self.cli.console.print(f'[bold red]Failed to load signin page after {max_retries} attempts: {str(e)}[/bold red]')
+                    
+                    # Check if we're in headless mode and this might be the issue
+                    if self.browser_options['headless']:
+                        self.cli.console.print('[red]Azure AD B2C authentication may not work in headless mode[/red]')
+                        self.cli.console.print('[yellow]Consider running with browser visible or check network connectivity[/yellow]')
+                    
+                    return False
+                else:
+                    self.cli.console.print(f'[yellow]Attempt {attempt + 1} failed, retrying... ({str(e)})[/yellow]')
+                    await asyncio.sleep(3)  # Wait before retry
+        
         try:
-            await self.page.waitForNavigation(timeout=timeout)
-        except Exception:
+            self.cli.console.print('[blue]Looking for email input field...[/blue]')
+            
+            # First, let's see what's actually on the page
+            page_title = await self.page.title()
+            self.cli.console.print(f'[blue]Page title: {page_title}[/blue]')
+            
+            # Try to find email input with different possible selectors
+            # Updated for Azure AD B2C and modern Kroger login
+            email_selectors = [
+                '#signInName',  # Original Kroger selector
+                '#email',  # Common Azure AD B2C selector
+                'input[name="signInName"]',  # Name attribute
+                'input[name="email"]',
+                'input[name="username"]',
+                'input[type="email"]',
+                'input[placeholder*="email"]',
+                'input[placeholder*="Email"]',
+                'input[id*="email"]',
+                'input[id*="Email"]',
+                'input[class*="email"]',
+                '[data-testid*="email"]'
+            ]
+            
+            email_selector = None
+            for selector in email_selectors:
+                try:
+                    await self.page.waitForSelector(selector, {'timeout': 2000})
+                    email_selector = selector
+                    self.cli.console.print(f'[green]Found email field with selector: {selector}[/green]')
+                    break
+                except Exception:
+                    continue
+            
+            if not email_selector:
+                self.cli.console.print('[red]No email field found[/red]')
+                return False
+            
+            await self.page.click(email_selector, {'clickCount': 3})  # Select all in the field
+            await self.page.type(email_selector, self.cli.username)
+            self.cli.console.print('[green]Email entered successfully[/green]')
+            
+            self.cli.console.print('[blue]Looking for password input field...[/blue]')
+            
+            # Try to find password input with different possible selectors
+            # Updated for Azure AD B2C and modern Kroger login
+            password_selectors = [
+                '#password',  # Current correct selector you found
+                '#signInPassword',  # Possible Kroger selector
+                'input[name="password"]',  # Name attribute
+                'input[type="password"]',
+                'input[placeholder*="password"]',
+                'input[placeholder*="Password"]',
+                'input[id*="password"]',
+                'input[id*="Password"]',
+                'input[class*="password"]',
+                '[data-testid*="password"]'
+            ]
+            
+            password_selector = None
+            for selector in password_selectors:
+                try:
+                    await self.page.waitForSelector(selector, {'timeout': 2000})
+                    password_selector = selector
+                    self.cli.console.print(f'[green]Found password field with selector: {selector}[/green]')
+                    break
+                except Exception:
+                    continue
+            
+            if not password_selector:
+                self.cli.console.print('[red]No password field found[/red]')
+                return False
+            
+            await self.page.click(password_selector, {'clickCount': 3})
+            await self.page.type(password_selector, self.cli.password)
+            self.cli.console.print('[green]Password entered successfully[/green]')
+            
+            self.cli.console.print('[blue]Submitting login form...[/blue]')
+            
+            # Try multiple ways to submit the form
+            try:
+                # First try: Look for and click the submit button
+                submit_selectors = [
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button[id*="submit"]',
+                    'button[id*="signin"]',
+                    'button[id*="login"]',
+                    '.btn-submit',
+                    '.submit-button'
+                ]
+                
+                submit_clicked = False
+                for selector in submit_selectors:
+                    try:
+                        await self.page.waitForSelector(selector, {'timeout': 3000})
+                        await self.page.click(selector)
+                        self.cli.console.print(f'[green]Clicked submit button: {selector}[/green]')
+                        submit_clicked = True
+                        break
+                    except Exception:
+                        continue
+                
+                if not submit_clicked:
+                    # Fallback: Press Enter on password field
+                    self.cli.console.print('[yellow]No submit button found, pressing Enter[/yellow]')
+                    await self.page.focus(password_selector)
+                    await self.page.keyboard.press('Enter')
+                
+            except Exception as e:
+                self.cli.console.print(f'[yellow]Submit attempt failed, trying Enter key: {str(e)}[/yellow]')
+                await self.page.keyboard.press('Enter')
+            
+            self.cli.console.print('[blue]Waiting for navigation after login...[/blue]')
+            await self.page.waitForNavigation({'timeout': timeout})
+            self.cli.console.print('[green]Navigation completed[/green]')
+            
+        except Exception as e:
+            self.cli.console.print(f'[bold red]Error during login process: {str(e)}[/bold red]')
             return False
 
         if contains is not None:
+            self.cli.console.print(f'[blue]Checking page content for: {contains}[/blue]')
             html = await self.page.content()
             for item in contains:
                 if item not in html:
+                    self.cli.console.print(f'[red]Expected content "{item}" not found on page[/red]')
                     return False
+            self.cli.console.print('[green]All expected content found[/green]')
 
         return True
 

@@ -13,7 +13,7 @@ from kroger_cli import helper
 class KrogerCLI:
     def __init__(self, config_file='config.ini'):
         self.config_file = config_file
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         self.username = None
         self.password = None
         self.console = Console()
@@ -52,9 +52,9 @@ class KrogerCLI:
 
     def prompt_credentials(self):
         self.console.print('In order to continue, please enter your username (email) and password for kroger.com '
-                           '(also works with Ralphs, Dillons, Smith’s and other Kroger’s Chains)')
+                           '(also works with Ralphs, Dillons, Smith\'s and other Kroger\'s Chains)')
         username = click.prompt('Username (email)')
-        password = click.prompt('Password')
+        password = click.prompt('Password', hide_input=True)
         self._set_credentials(username, password)
 
     def prompt_options(self):
