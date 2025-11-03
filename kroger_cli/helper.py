@@ -115,27 +115,38 @@ def process_purchases_summary(purchases):
 
 
 def map_account_info(config, account_info):
-    if account_info['firstName']:
+    # Handle case where account_info is None (authentication failed)
+    if account_info is None:
+        return config
+        
+    # Handle case where account_info doesn't have expected fields
+    if not isinstance(account_info, dict):
+        return config
+        
+    if account_info.get('firstName'):
         config['profile']['first_name'] = account_info['firstName']
-    if account_info['lastName']:
+    if account_info.get('lastName'):
         config['profile']['last_name'] = account_info['lastName']
-    if account_info['emailAddress']:
+    if account_info.get('emailAddress'):
         config['profile']['email_address'] = account_info['emailAddress']
-    if account_info['loyaltyCardNumber']:
+    if account_info.get('loyaltyCardNumber'):
         config['profile']['loyalty_card_number'] = account_info['loyaltyCardNumber']
-    if account_info['mobilePhoneNumber']:
+    if account_info.get('altId'):
+        config['profile']['alt_id'] = account_info['altId']
+    if account_info.get('mobilePhoneNumber'):
         config['profile']['mobile_phone'] = account_info['mobilePhoneNumber']
 
-    if account_info['address']['addressLine1']:
-        config['profile']['address_line1'] = account_info['address']['addressLine1']
-    if account_info['address']['addressLine2']:
-        config['profile']['address_line2'] = account_info['address']['addressLine2']
-    if account_info['address']['city']:
-        config['profile']['city'] = account_info['address']['city']
-    if account_info['address']['stateCode']:
-        config['profile']['state'] = account_info['address']['stateCode']
-    if account_info['address']['zip']:
-        config['profile']['zip'] = account_info['address']['zip']
+    if account_info.get('address') and isinstance(account_info['address'], dict):
+        if account_info['address'].get('addressLine1'):
+            config['profile']['address_line1'] = account_info['address']['addressLine1']
+        if account_info['address'].get('addressLine2'):
+            config['profile']['address_line2'] = account_info['address']['addressLine2']
+        if account_info['address'].get('city'):
+            config['profile']['city'] = account_info['address']['city']
+        if account_info['address'].get('stateCode'):
+            config['profile']['state'] = account_info['address']['stateCode']
+        if account_info['address'].get('zip'):
+            config['profile']['zip'] = account_info['address']['zip']
 
     return config
 

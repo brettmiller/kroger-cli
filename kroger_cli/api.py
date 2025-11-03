@@ -148,22 +148,158 @@ class KrogerAPI:
         return False
 
     async def _get_account_info(self):
-        signed_in = await self.sign_in_routine()
+        # First try to get basic info from dashboard, then detailed info from profile page
+        signed_in = await self.sign_in_routine(redirect_url='/account/dashboard/', contains=['dashboard', 'account'])
         if not signed_in:
+            self.cli.console.print('[red]Authentication failed, returning empty account info[/red]')
             await self.destroy()
-            return None
+            return {
+                'firstName': '',
+                'lastName': '',
+                'emailAddress': '',
+                'loyaltyCardNumber': '',
+                'mobilePhoneNumber': '',
+                'address': {
+                    'addressLine1': '',
+                    'addressLine2': '',
+                    'city': '',
+                    'state': '',
+                    'zipCode': ''
+                }
+            }
 
-        self.cli.console.print('Loading profile info..')
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/accountmanagement/api/profile')
+        self.cli.console.print('Loading profile info from dashboard and profile pages..')
+        
+        # Wait for page to fully load
+        await self.page.waitFor(3000)
+        
         try:
-            content = await self.page.content()
-            profile = self._get_json_from_page_content(content)
-            user_id = profile['userId']
-        except Exception:
-            profile = None
-        await self.destroy()
-
-        return profile
+            # Get basic info from dashboard (like the welcome message)
+            dashboard_info = await self.page.evaluate('''
+                () => {
+                    const info = {};
+                    
+                    // Look for welcome message with name - specifically "Welcome, BRETT"
+                    const allText = document.body.textContent;
+                    const welcomePatterns = [
+                        /Welcome,\\s+([A-Z]+)/i,
+                        /Hello,\\s+([A-Z]+)/i,
+                        /Hi,\\s+([A-Z]+)/i
+                    ];
+                    
+                    for (const pattern of welcomePatterns) {
+                        const match = allText.match(pattern);
+                        if (match) {
+                            info.firstName = match[1].trim();
+                            break;
+                        }
+                    }
+                    
+                    return info;
+                }
+            ''')
+            
+            self.cli.console.print(f'[blue]Dashboard info found: {dashboard_info}[/blue]')
+            
+            # Now navigate to the profile page for detailed information
+            profile_url = 'https://www.' + self.cli.config['main']['domain'] + '/account/update'
+            self.cli.console.print(f'[blue]Navigating to profile page: {profile_url}[/blue]')
+            
+            await self.page.goto(profile_url)
+            await self.page.waitFor(3000)  # Wait for profile page to load
+            
+            # Extract detailed info from profile page
+            profile_info = await self.page.evaluate('''
+                () => {
+                    const info = {};
+                    
+                    // Look for first name input
+                    const firstNameInput = document.querySelector('input[data-qa="Name-firstNameInput"]') || 
+                                         document.querySelector('input[name="firstName"]');
+                    if (firstNameInput) {
+                        info.firstName = firstNameInput.value;
+                    }
+                    
+                    // Look for last name input
+                    const lastNameInput = document.querySelector('input[data-qa="Name-lastNameInput"]') || 
+                                        document.querySelector('input[name="lastName"]');
+                    if (lastNameInput) {
+                        info.lastName = lastNameInput.value;
+                    }
+                    
+                    // Look for email address span
+                    const emailSpan = document.querySelector('span[data-qa*="Current Email"]');
+                    if (emailSpan) {
+                        info.email = emailSpan.textContent.trim();
+                    }
+                    
+                    // Look for loyalty card number span
+                    const loyaltySpan = document.querySelector('span[data-qa*="Current Plus Card Number"]');
+                    if (loyaltySpan) {
+                        info.loyaltyCard = loyaltySpan.textContent.trim();
+                    }
+                    
+                    // Look for Alt ID span
+                    const altIdSpan = document.querySelector('span[data-qa*="Current Alt ID"]');
+                    if (altIdSpan) {
+                        info.altId = altIdSpan.textContent.trim();
+                    }
+                    
+                    // Look for phone number input
+                    const phoneInput = document.querySelector('input[data-qa="HomePhone-input"]') || 
+                                     document.querySelector('input[name="homePhone"]');
+                    if (phoneInput && phoneInput.value) {
+                        info.phone = phoneInput.value;
+                    }
+                    
+                    return info;
+                }
+            ''')
+            
+            self.cli.console.print(f'[blue]Profile page info found: {profile_info}[/blue]')
+            
+            # Combine dashboard and profile info, prefer profile page data for names
+            account_info = {
+                'firstName': profile_info.get('firstName') or dashboard_info.get('firstName') or '',
+                'lastName': profile_info.get('lastName') or '',
+                'emailAddress': profile_info.get('email') or '',
+                'loyaltyCardNumber': profile_info.get('loyaltyCard') or '',
+                'mobilePhoneNumber': profile_info.get('phone') or '',
+                'address': {
+                    'addressLine1': '',
+                    'addressLine2': '',
+                    'city': '',
+                    'state': '',
+                    'zipCode': ''
+                }
+            }
+            
+            # Add Alt ID to the display if available
+            if profile_info.get('altId'):
+                account_info['altId'] = profile_info['altId']
+            
+            self.cli.console.print(f'[green]Combined account info: {account_info}[/green]')
+            return account_info
+                
+        except Exception as e:
+            self.cli.console.print(f'[red]Error loading account info: {str(e)}[/red]')
+            # Return empty structure to prevent KeyError
+            return {
+                'firstName': '',
+                'lastName': '',
+                'emailAddress': '',
+                'loyaltyCardNumber': '',
+                'mobilePhoneNumber': '',
+                'address': {
+                    'addressLine1': '',
+                    'addressLine2': '',
+                    'city': '',
+                    'state': '',
+                    'zipCode': ''
+                }
+            }
+        finally:
+            await self.destroy()
 
     async def _get_points_balance(self):
         signed_in = await self.sign_in_routine()
@@ -359,6 +495,32 @@ class KrogerAPI:
             contains = ['Profile Information']
 
         await self.init()
+        
+        # First, check if we're already authenticated by trying to access the target page directly
+        self.cli.console.print('[italic]Checking for existing authentication...[/italic]')
+        target_url = 'https://www.' + self.cli.config['main']['domain'] + redirect_url
+        
+        try:
+            # Try to navigate directly to the target page
+            await self.page.goto(target_url, {'timeout': 10000})
+            await asyncio.sleep(2)  # Give page time to load
+            
+            current_url = self.page.url
+            page_content = await self.page.content()
+            
+            # Check if we're actually on the target page (not redirected to login)
+            if current_url.startswith(target_url) or (contains and any(term in page_content for term in contains)):
+                self.cli.console.print('[green]Already authenticated! Skipping login process.[/green]')
+                return True
+            elif 'signin' in current_url.lower() or 'login' in current_url.lower() or 'auth' in current_url.lower():
+                self.cli.console.print('[yellow]Not authenticated, proceeding with login...[/yellow]')
+            else:
+                self.cli.console.print(f'[yellow]Unexpected redirect to: {current_url}, will try authentication...[/yellow]')
+                
+        except Exception as e:
+            self.cli.console.print(f'[yellow]Could not check existing authentication: {str(e)}, proceeding with login...[/yellow]')
+        
+        # If not already authenticated, proceed with normal login
         self.cli.console.print('[italic]Signing in.. (please wait, it might take awhile)[/italic]')
         signed_in = await self.sign_in(redirect_url, contains)
 

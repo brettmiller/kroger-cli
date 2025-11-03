@@ -149,7 +149,48 @@ class KrogerCLI:
         else:
             self.config = helper.map_account_info(self.config, info)
             self._write_config_file()
-            self.console.print(self.config.items(section='profile'))
+            
+            # Format and display the account info nicely
+            self.console.print('[bold blue]Account Information:[/bold blue]')
+            self.console.print('─' * 50)
+            
+            profile_items = dict(self.config.items(section='profile'))
+            
+            if profile_items.get('first_name') or profile_items.get('last_name'):
+                name = f"{profile_items.get('first_name', '')} {profile_items.get('last_name', '')}".strip()
+                if name:
+                    self.console.print(f'[green]Name:[/green] {name}')
+            
+            if profile_items.get('email_address'):
+                self.console.print(f'[green]Email:[/green] {profile_items["email_address"]}')
+            
+            if profile_items.get('loyalty_card_number'):
+                self.console.print(f'[green]Loyalty Card:[/green] {profile_items["loyalty_card_number"]}')
+                
+            if profile_items.get('alt_id'):
+                self.console.print(f'[green]Alt ID:[/green] {profile_items["alt_id"]}')
+            
+            if profile_items.get('mobile_phone'):
+                self.console.print(f'[green]Mobile Phone:[/green] {profile_items["mobile_phone"]}')
+            
+            # Address information
+            address_parts = []
+            if profile_items.get('address_line1'):
+                address_parts.append(profile_items['address_line1'])
+            if profile_items.get('address_line2'):
+                address_parts.append(profile_items['address_line2'])
+            if profile_items.get('city'):
+                city_state_zip = profile_items['city']
+                if profile_items.get('state'):
+                    city_state_zip += f", {profile_items['state']}"
+                if profile_items.get('zip'):
+                    city_state_zip += f" {profile_items['zip']}"
+                address_parts.append(city_state_zip)
+            
+            if address_parts:
+                self.console.print(f'[green]Address:[/green] {", ".join(address_parts)}')
+            
+            self.console.print('─' * 50)
 
     def option_points_balance(self):
         balance = self.api.get_points_balance()
