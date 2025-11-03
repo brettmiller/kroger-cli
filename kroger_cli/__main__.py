@@ -36,16 +36,10 @@ def points_balance():
     kroger_cli.option_points_balance()
 
 
-@click.command('survey', help='Complete Kroger’s Survey (to earn 50 points).')
-def survey():
-    kroger_cli.option_survey()
-
-
 if __name__ == '__main__':
     cli.add_command(account_info)
     cli.add_command(clip_coupons)
     cli.add_command(purchases_summary)
     cli.add_command(points_balance)
-    cli.add_command(survey)
 
     cli()

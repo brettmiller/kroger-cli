@@ -29,14 +29,6 @@ class KrogerAPI:
     def __init__(self, cli):
         self.cli: kroger_cli.cli.KrogerCLI = cli
 
-    def complete_survey(self):
-        # Cannot use headless mode here for some reason (sign-in cookie doesn't stick)
-        self.browser_options['headless'] = False
-        res = asyncio.run(self._complete_survey())
-        self.browser_options['headless'] = True
-
-        return res
-
     @memoized
     def get_account_info(self):
         return asyncio.run(self._get_account_info())
@@ -59,7 +51,7 @@ class KrogerAPI:
     def get_purchases_summary(self):
         return asyncio.run(self._get_purchases_summary())
 
-    async def _retrieve_feedback_url(self):
+    async def _get_account_info(self):
         self.cli.console.print('Loading `My Purchases` page (to retrieve the Feedback’s Entry ID)')
 
         # Model overlay pop up (might not exist)
