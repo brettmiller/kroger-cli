@@ -9,25 +9,23 @@ from pyppeteer import launch
 
 
 class KrogerAPI:
-    browser_options = {
-        'headless': True,
-        'userDataDir': '.user-data',
-        'args': ['--no-sandbox',
-                 '--disable-dev-shm-usage',
-                 '--disable-blink-features=AutomationControlled',  # Hide automation detection
-                 '--exclude-switches=enable-automation',  # Remove automation switches
-                 '--disable-extensions-except',  # Disable extension detection
-                 '--disable-plugins-discovery',  # Disable plugin discovery
-                 '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36']
-    }
-    headers = {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-                      'Chrome/81.0.4044.129 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
-
     def __init__(self, cli):
         self.cli: kroger_cli.cli.KrogerCLI = cli
+        # Initialize browser and page attributes to None
+        self.browser = None
+        self.page = None
+        # Make browser_options an instance variable so it doesn't get shared
+        self.browser_options = {
+            'headless': True,
+            'userDataDir': '.user-data',
+            'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
+                     '--no-sandbox']
+        }
+        self.headers = {
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/81.0.4044.129 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
 
     @memoized
     def get_account_info(self):
@@ -38,18 +36,8 @@ class KrogerAPI:
         return asyncio.run(self._get_points_balance())
 
     def clip_coupons(self):
-        # Force non-headless mode for clip_coupons since Azure AD B2C has issues in headless mode
-        original_headless = self.browser_options['headless']
-        self.browser_options['headless'] = False
-        try:
-            result = asyncio.run(self._clip_coupons())
-        finally:
-            self.browser_options['headless'] = original_headless
-        return result
-
-    @memoized
-    def get_purchases_summary(self):
-        return asyncio.run(self._get_purchases_summary())
+        # Try headless mode first with improved error handling
+        return asyncio.run(self._clip_coupons())
 
     async def _get_account_info(self):
         self.cli.console.print('Loading `My Purchases` page (to retrieve the Feedback’s Entry ID)')
@@ -294,19 +282,174 @@ class KrogerAPI:
             await self.destroy()
 
     async def _get_points_balance(self):
-        signed_in = await self.sign_in_routine()
+        # For points balance, we need actual page content to work, so use a content check
+        # This will trigger fallback to visible mode if headless can't load the page properly
+        signed_in = await self.sign_in_routine(redirect_url='/points/summary', contains=['points', 'balance', 'kroger'])
         if not signed_in:
             await self.destroy()
             return None
 
         self.cli.console.print('Loading points balance..')
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/accountmanagement/api/points-summary')
+        
+        # Wait for any redirect chain to complete
+        await self.page.waitFor(3000)
+        
+        # Check if we're on the right page, if not navigate directly
+        current_url = self.page.url
+        target_url = 'https://www.' + self.cli.config['main']['domain'] + '/points/summary'
+        
+        if not current_url.startswith(target_url):
+            self.cli.console.print(f'[yellow]Not on points page, navigating to {target_url}[/yellow]')
+            try:
+                await self.page.goto(target_url)
+            except Exception as e:
+                error_msg = str(e)
+                if 'net::ERR_HTTP2_PROTOCOL_ERROR' in error_msg:
+                    self.cli.console.print('[yellow]HTTP/2 protocol error during navigation, continuing anyway...[/yellow]')
+                    # Continue - sometimes the page content is still accessible despite the error
+                else:
+                    self.cli.console.print(f'[red]Navigation error: {error_msg}[/red]')
+                    raise
+            
+        # Wait longer for page to load and any async content
+        await self.page.waitFor(8000)
+        
         try:
-            content = await self.page.content()
-            balance = self._get_json_from_page_content(content)
-            program_balance = balance[0]['programBalance']['balance']
-        except Exception:
+            # Try to extract points balance from the page using proper HTML parsing
+            points_info = await self.page.evaluate('''
+                () => {
+                    const info = {
+                        monthlyBalances: [],
+                        totalBalance: 0
+                    };
+                    
+                    // Look for the points cards using multiple approaches
+                    let pointsCards = document.querySelectorAll('.PointsLargeCard');
+                    
+                    // If we didn't find any, try broader selectors
+                    if (pointsCards.length === 0) {
+                        pointsCards = document.querySelectorAll('.kds-Card');
+                    }
+                    
+                    for (const card of pointsCards) {
+                        // Get the month from the data-testid element
+                        const monthElement = card.querySelector('[data-testid="LargePointCardMonth"]') || 
+                                           card.querySelector('[data-testid*="Month"]');
+                        // Get the points value - try multiple selectors
+                        const pointsElement = card.querySelector('.PointsLargeValue') || 
+                                            card.querySelector('.font-bold.font-secondary') ||
+                                            card.querySelector('[class*="Value"]') ||
+                                            card.querySelector('.font-bold');
+                        // Get the expiration info
+                        const expirationElement = card.querySelector('[data-testid="LargePointCardExpiration"]') ||
+                                                 card.querySelector('[data-testid*="Expiration"]');
+                        
+                        if (monthElement && pointsElement) {
+                            const month = monthElement.textContent.trim();
+                            const pointsText = pointsElement.textContent.trim();
+                            const points = parseInt(pointsText);
+                            
+                            // Skip if the points text is not a number (like "Points Summary")
+                            if (isNaN(points)) {
+                                continue;
+                            }
+                            
+                            let expiration = '';
+                            if (expirationElement) {
+                                expiration = expirationElement.textContent.trim();
+                            }
+                            
+                            // Include all months, even with 0 points
+                            if (points >= 0) {
+                                info.monthlyBalances.push({
+                                    month: month,
+                                    points: points,
+                                    expiration: expiration
+                                });
+                                info.totalBalance += points;
+                            }
+                        }
+                    }
+                    
+                    // If no cards found, try fallback methods
+                    if (info.monthlyBalances.length === 0) {
+                        // Try basic text patterns as last resort
+                        const allText = document.body.textContent;
+                        const basicPatterns = [
+                            /(\\d+)\\s*Available\\s*Points/i,
+                            /Total[:\\s]*(\\d+)\\s*points?/i,
+                            /Balance[:\\s]*(\\d+)/i
+                        ];
+                        
+                        for (const pattern of basicPatterns) {
+                            const match = allText.match(pattern);
+                            if (match) {
+                                info.totalBalance = parseInt(match[1]);
+                                info.monthlyBalances.push({
+                                    month: 'Current',
+                                    points: parseInt(match[1]),
+                                    expiration: ''
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    
+                    return info;
+                }
+            ''')
+            
+            self.cli.console.print(f'[green]Found {len(points_info.get("monthlyBalances", []))} monthly balance(s), total: {points_info.get("totalBalance", 0)} points[/green]')
+            
+            if points_info.get('monthlyBalances') and len(points_info['monthlyBalances']) > 0:
+                # Format the response to match the expected structure
+                # The CLI expects balance[0] to be metadata and balance[1+] to be actual programs
+                balance = [
+                    {
+                        # Metadata entry (index 0)
+                        'metadata': 'success'
+                    }
+                ]
+                
+                # Add each monthly balance as a separate program entry
+                for monthly_balance in points_info['monthlyBalances']:
+                    expiration_text = monthly_balance.get('expiration', '')
+                    if expiration_text:
+                        description = f"{monthly_balance['points']} points ({expiration_text})"
+                    else:
+                        description = f"{monthly_balance['points']} points"
+                    
+                    balance.append({
+                        'programDisplayInfo': {
+                            'loyaltyProgramName': f"Kroger Fuel Points ({monthly_balance['month']})"
+                        },
+                        'programBalance': {
+                            'balance': monthly_balance['points'],
+                            'balanceDescription': description
+                        }
+                    })
+                
+                # Also add a total if there are multiple months
+                if len(points_info['monthlyBalances']) > 1:
+                    balance.append({
+                        'programDisplayInfo': {
+                            'loyaltyProgramName': 'Kroger Fuel Points (Total)'
+                        },
+                        'programBalance': {
+                            'balance': points_info['totalBalance'],
+                            'balanceDescription': f"{points_info['totalBalance']} points total"
+                        }
+                    })
+            else:
+                # Fallback: try the old JSON method in case the page still has it
+                self.cli.console.print('[yellow]No monthly points found in HTML, trying JSON fallback...[/yellow]')
+                content = await self.page.content()
+                balance = self._get_json_from_page_content(content)
+                
+        except Exception as e:
+            self.cli.console.print(f'[red]Error extracting points balance: {str(e)}[/red]')
             balance = None
+        
         await self.destroy()
 
         return balance
@@ -320,6 +463,21 @@ class KrogerAPI:
 
         # Wait for page to fully load
         await self.page.waitFor(3000)
+        
+        # Check if we actually got to a coupons page by looking for coupon-related elements
+        try:
+            page_content = await self.page.content()
+            current_url = self.page.url
+            
+            # If we have coupon content or are on the right URL, proceed
+            if ('coupon' in page_content.lower() or 
+                'savings' in current_url.lower() or 
+                'clip' in page_content.lower()):
+                self.cli.console.print('[green]Successfully accessed coupons page in headless mode[/green]')
+            else:
+                self.cli.console.print('[yellow]Page content verification failed, but attempting to proceed...[/yellow]')
+        except Exception as e:
+            self.cli.console.print(f'[yellow]Could not verify page content: {str(e)}, proceeding anyway...[/yellow]')
 
         self.cli.console.print('[italic]Searching for available coupons to clip...[/italic]')
         
@@ -379,15 +537,60 @@ class KrogerAPI:
                 
                 # Second pass: click all clippable buttons rapidly
                 clicked_testids = []
+                max_offers_reached = False
+                
                 for button, testid, coupon_num in clippable_buttons:
                     try:
                         await button.click()
                         clicked_testids.append((testid, coupon_num))
                         print(f"Clicked coupon {coupon_num}")
-                        # Small delay to avoid overwhelming the server
-                        await asyncio.sleep(0.1)
+                        
+                        # Check for maximum offers reached after clicking
+                        await asyncio.sleep(0.2)  # Give time for any error messages to appear
+                        
+                        # Check for banner message at top of page
+                        try:
+                            page_content = await self.page.content()
+                            if ('maximum number of offers' in page_content.lower() or 
+                                'reached the maximum' in page_content.lower() or
+                                'maximum number of offers clipped' in page_content.lower()):
+                                self.cli.console.print('[yellow]Maximum number of offers reached! Stopping coupon clipping.[/yellow]')
+                                max_offers_reached = True
+                                break
+                        except Exception:
+                            pass
+                        
+                        # Also check if the button itself shows an error message
+                        try:
+                            updated_button = await self.page.querySelector(f'button[data-testid="{testid}"]')
+                            if updated_button:
+                                button_text = await self.page.evaluate('(element) => element.textContent.trim()', updated_button)
+                                if 'maximum' in button_text.lower():
+                                    self.cli.console.print('[yellow]Maximum number of offers reached! Stopping coupon clipping.[/yellow]')
+                                    max_offers_reached = True
+                                    break
+                        except Exception:
+                            pass
+                            
                     except Exception as e:
+                        error_msg = str(e)
+                        # Check if this is a "Node is detached" error, which often indicates DOM changes from limit reached
+                        if 'detached from document' in error_msg.lower():
+                            # Check if maximum offers message appeared
+                            try:
+                                page_content = await self.page.content()
+                                if ('maximum number of offers' in page_content.lower() or 
+                                    'reached the maximum' in page_content.lower()):
+                                    self.cli.console.print('[yellow]Maximum number of offers reached! Stopping coupon clipping.[/yellow]')
+                                    max_offers_reached = True
+                                    break
+                            except Exception:
+                                pass
+                        
                         print(f"✗ Error clicking coupon {coupon_num}: {e}")
+                
+                if max_offers_reached:
+                    self.cli.console.print('[blue]Stopped clipping due to maximum offers limit[/blue]')
                 
                 # Third pass: wait a bit and then verify all clicks
                 self.cli.console.print('[blue]Waiting for coupons to update...[/blue]')
@@ -479,8 +682,24 @@ class KrogerAPI:
         await self.page.setViewport({'width': 1366, 'height': 768})  # Common screen resolution
 
     async def destroy(self):
-        await self.page.close()
-        await self.browser.close()
+        try:
+            if hasattr(self, 'page') and self.page:
+                await self.page.close()
+        except Exception:
+            pass  # Ignore errors during page cleanup
+        
+        try:
+            if hasattr(self, 'browser') and self.browser:
+                # Properly close browser and all its processes
+                await self.browser.close()
+                # Force kill any remaining processes to prevent atexit errors
+                if hasattr(self.browser, 'process') and self.browser.process:
+                    try:
+                        self.browser.process.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # Ignore errors during browser cleanup
 
     async def sign_in_routine(self, redirect_url='/account/update', contains=None):
         if contains is None and redirect_url == '/account/update':
@@ -516,12 +735,19 @@ class KrogerAPI:
         self.cli.console.print('[italic]Signing in.. (please wait, it might take awhile)[/italic]')
         signed_in = await self.sign_in(redirect_url, contains)
 
+        # Only fallback to non-headless if authentication truly failed AND we're in headless mode
         if not signed_in and self.browser_options['headless']:
-            self.cli.console.print('[red]Sign in failed. Trying one more time..[/red]')
-            self.browser_options['headless'] = False
-            await self.destroy()
-            await self.init()
-            signed_in = await self.sign_in(redirect_url, contains)
+            self.cli.console.print('[red]Sign in failed in headless mode. Trying with browser visible..[/red]')
+            # Save original headless setting
+            original_headless = self.browser_options['headless']
+            try:
+                self.browser_options['headless'] = False
+                await self.destroy()
+                await self.init()
+                signed_in = await self.sign_in(redirect_url, contains)
+            finally:
+                # Always restore original headless setting
+                self.browser_options['headless'] = original_headless
 
         if not signed_in:
             self.cli.console.print('[bold red]Sign in failed. Please make sure the username/password is correct.'
@@ -576,17 +802,17 @@ class KrogerAPI:
                     break
                     
             except Exception as e:
+                error_msg = str(e)
                 if attempt == max_retries - 1:  # Last attempt
-                    self.cli.console.print(f'[bold red]Failed to load signin page after {max_retries} attempts: {str(e)}[/bold red]')
-                    
-                    # Check if we're in headless mode and this might be the issue
-                    if self.browser_options['headless']:
-                        self.cli.console.print('[red]Azure AD B2C authentication may not work in headless mode[/red]')
-                        self.cli.console.print('[yellow]Consider running with browser visible or check network connectivity[/yellow]')
-                    
-                    return False
+                    # For HTTP/2 errors, continue anyway since auth often still works
+                    if 'net::ERR_HTTP2_PROTOCOL_ERROR' in error_msg:
+                        self.cli.console.print('[yellow]HTTP/2 protocol error, but continuing with authentication...[/yellow]')
+                        break
+                    else:
+                        self.cli.console.print(f'[bold red]Failed to load signin page after {max_retries} attempts: {error_msg}[/bold red]')
+                        return False
                 else:
-                    self.cli.console.print(f'[yellow]Attempt {attempt + 1} failed, retrying... ({str(e)})[/yellow]')
+                    self.cli.console.print(f'[yellow]Attempt {attempt + 1} failed, retrying... ({error_msg})[/yellow]')
                     await asyncio.sleep(3)  # Wait before retry
         
         try:
@@ -707,8 +933,16 @@ class KrogerAPI:
             self.cli.console.print('[green]Navigation completed[/green]')
             
         except Exception as e:
-            self.cli.console.print(f'[bold red]Error during login process: {str(e)}[/bold red]')
-            return False
+            error_msg = str(e)
+            # Handle "context destroyed" errors specifically - these are often normal for OAuth flows
+            if 'context was destroyed' in error_msg.lower() or 'execution context was destroyed' in error_msg.lower():
+                self.cli.console.print('[yellow]Context destroyed during login - this is normal for OAuth redirects[/yellow]')
+                # Don't return False - this is often a successful login that just lost context tracking
+                # Wait a bit for any navigation to complete
+                await asyncio.sleep(3)
+            else:
+                self.cli.console.print(f'[bold red]Error during login process: {error_msg}[/bold red]')
+                return False
 
         if contains is not None:
             self.cli.console.print(f'[blue]Checking page content for: {contains}[/blue]')
