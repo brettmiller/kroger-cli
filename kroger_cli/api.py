@@ -5,15 +5,16 @@ import datetime
 import kroger_cli.cli
 from kroger_cli.memoize import memoized
 from kroger_cli import helper
-from pyppeteer import launch
+from playwright.async_api import async_playwright, BrowserContext, Page
 
 
 class KrogerAPI:
     def __init__(self, cli):
         self.cli: kroger_cli.cli.KrogerCLI = cli
-        # Initialize browser and page attributes to None
-        self.browser = None
-        self.page = None
+        # Initialize browser and page attributes with proper types
+        self.browser: BrowserContext | None = None
+        self.page: Page | None = None
+        self.playwright = None
         # Make browser_options an instance variable so it doesn't get shared
         self.browser_options = {
             'headless': True,
@@ -45,17 +46,17 @@ class KrogerAPI:
         # Model overlay pop up (might not exist)
         # Need to click on it, as it prevents me from clicking on `Order Details` link
         try:
-            await self.page.waitForSelector('.ModalitySelectorDynamicTooltip--Overlay', {'timeout': 10000})
+            await self.page.wait_for_selector('.ModalitySelectorDynamicTooltip--Overlay', timeout=10000)
             await self.page.click('.ModalitySelectorDynamicTooltip--Overlay')
         except Exception:
             pass
 
         try:
             # `See Order Details` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button', {'timeout': 10000})
+            await self.page.wait_for_selector('.PurchaseCard-top-view-details-button', timeout=10000)
             await self.page.click('.PurchaseCard-top-view-details-button a')
             # `View Receipt` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button a', {'timeout': 10000})
+            await self.page.wait_for_selector('.PurchaseCard-top-view-details-button a', timeout=10000)
             await self.page.click('.PurchaseCard-top-view-details-button a')
             content = await self.page.content()
         except Exception:
@@ -107,7 +108,7 @@ class KrogerAPI:
             return None
 
         await self.page.goto(url)
-        await self.page.waitForSelector('#Index_VisitDateDatePicker', {'timeout': 10000})
+        await self.page.wait_for_selector('#Index_VisitDateDatePicker', timeout=10000)
         # We need to manually set the date, otherwise the validation fails
         js = "() => {$('#Index_VisitDateDatePicker').datepicker('setDate', '" + survey_date + "');}"
         await self.page.evaluate(js)
@@ -116,7 +117,7 @@ class KrogerAPI:
         for i in range(35):
             current_url = self.page.url
             try:
-                await self.page.waitForSelector('#NextButton', {'timeout': 5000})
+                await self.page.wait_for_selector('#NextButton', timeout=5000)
             except Exception:
                 if 'Finish' in current_url:
                     await self.destroy()
@@ -151,7 +152,7 @@ class KrogerAPI:
         self.cli.console.print('Loading profile info from dashboard and profile pages..')
         
         # Wait for page to fully load
-        await self.page.waitFor(3000)
+        await self.page.wait_for_timeout(3000)
         
         try:
             # Get basic info from dashboard (like the welcome message)
@@ -186,7 +187,7 @@ class KrogerAPI:
             self.cli.console.print(f'[blue]Navigating to profile page: {profile_url}[/blue]')
             
             await self.page.goto(profile_url)
-            await self.page.waitFor(3000)  # Wait for profile page to load
+            await self.page.wait_for_timeout(3000)  # Wait for profile page to load
             
             # Extract detailed info from profile page
             profile_info = await self.page.evaluate('''
@@ -282,85 +283,80 @@ class KrogerAPI:
             await self.destroy()
 
     async def _get_points_balance(self):
-        # For points balance, we need actual page content to work, so use a content check
-        # This will trigger fallback to visible mode if headless can't load the page properly
-        signed_in = await self.sign_in_routine(redirect_url='/points/summary', contains=['points', 'balance', 'kroger'])
+        # Use the same pattern as account-info - simple and reliable
+        signed_in = await self.sign_in_routine(redirect_url='/points/summary', contains=['points'])
         if not signed_in:
             await self.destroy()
             return None
 
         self.cli.console.print('Loading points balance..')
         
-        # Wait for any redirect chain to complete
-        await self.page.waitFor(3000)
+        # Wait for page to fully load (same as account-info)
+        await self.page.wait_for_timeout(3000)
         
-        # Check if we're on the right page, if not navigate directly
-        current_url = self.page.url
+        # Navigate directly to points page (same pattern as account-info)
         target_url = 'https://www.' + self.cli.config['main']['domain'] + '/points/summary'
+        self.cli.console.print(f'[blue]Navigating to points page: {target_url}[/blue]')
         
-        if not current_url.startswith(target_url):
-            self.cli.console.print(f'[yellow]Not on points page, navigating to {target_url}[/yellow]')
-            try:
-                await self.page.goto(target_url)
-            except Exception as e:
-                error_msg = str(e)
-                if 'net::ERR_HTTP2_PROTOCOL_ERROR' in error_msg:
-                    self.cli.console.print('[yellow]HTTP/2 protocol error during navigation, continuing anyway...[/yellow]')
-                    # Continue - sometimes the page content is still accessible despite the error
-                else:
-                    self.cli.console.print(f'[red]Navigation error: {error_msg}[/red]')
-                    raise
-            
-        # Wait longer for page to load and any async content
-        await self.page.waitFor(8000)
+        await self.page.goto(target_url)
+        await self.page.wait_for_timeout(5000)  # Wait for points page to load
+        
+        # Debug: Take a screenshot and save HTML for inspection
+        try:
+            await self.page.screenshot(path="debug_points_page.png", full_page=True)
+            html_content = await self.page.content()
+            with open("debug_points_page.html", "w") as f:
+                f.write(html_content)
+            self.cli.console.print("[dim]Debug: Saved screenshot and HTML content[/dim]")
+        except Exception:
+            pass
         
         try:
-            # Try to extract points balance from the page using proper HTML parsing
+            # Look specifically for points summary cards - be much more selective
             points_info = await self.page.evaluate('''
                 () => {
                     const info = {
                         monthlyBalances: [],
-                        totalBalance: 0
+                        totalBalance: 0,
+                        debugInfo: {
+                            foundElements: [],
+                            pageText: document.body.textContent.substring(0, 500),
+                            pageTitle: document.title,
+                            url: window.location.href
+                        }
                     };
                     
-                    // Look for the points cards using multiple approaches
-                    let pointsCards = document.querySelectorAll('.PointsLargeCard');
+                    // Strategy 1: Look for specific large points cards (monthly summaries)
+                    const largePointsCards = document.querySelectorAll('.PointsLargeCard, [data-testid*="LargePointCard"], [class*="PointsLarge"]');
+                    info.debugInfo.foundElements.push(`Found ${largePointsCards.length} large points cards`);
                     
-                    // If we didn't find any, try broader selectors
-                    if (pointsCards.length === 0) {
-                        pointsCards = document.querySelectorAll('.kds-Card');
-                    }
-                    
-                    for (const card of pointsCards) {
-                        // Get the month from the data-testid element
+                    for (const card of largePointsCards) {
+                        // Look for month element
                         const monthElement = card.querySelector('[data-testid="LargePointCardMonth"]') || 
-                                           card.querySelector('[data-testid*="Month"]');
-                        // Get the points value - try multiple selectors
+                                           card.querySelector('[data-testid*="Month"]') ||
+                                           card.querySelector('.month, .Month');
+                        
+                        // Look for points value element  
                         const pointsElement = card.querySelector('.PointsLargeValue') || 
-                                            card.querySelector('.font-bold.font-secondary') ||
-                                            card.querySelector('[class*="Value"]') ||
+                                            card.querySelector('[data-testid*="Value"]') ||
+                                            card.querySelector('.value, .Value') ||
                                             card.querySelector('.font-bold');
-                        // Get the expiration info
-                        const expirationElement = card.querySelector('[data-testid="LargePointCardExpiration"]') ||
-                                                 card.querySelector('[data-testid*="Expiration"]');
+                        
+                        // Look for expiration element
+                        const expirationElement = card.querySelector('[data-testid*="Expiration"]') ||
+                                                 card.querySelector('.expiration, .Expiration');
                         
                         if (monthElement && pointsElement) {
                             const month = monthElement.textContent.trim();
                             const pointsText = pointsElement.textContent.trim();
-                            const points = parseInt(pointsText);
+                            const points = parseInt(pointsText.replace(/[^0-9]/g, ''));
                             
-                            // Skip if the points text is not a number (like "Points Summary")
-                            if (isNaN(points)) {
-                                continue;
-                            }
-                            
-                            let expiration = '';
-                            if (expirationElement) {
-                                expiration = expirationElement.textContent.trim();
-                            }
-                            
-                            // Include all months, even with 0 points
-                            if (points >= 0) {
+                            if (!isNaN(points) && points >= 0) {  // Include 0 points as well
+                                let expiration = '';
+                                if (expirationElement) {
+                                    expiration = expirationElement.textContent.trim();
+                                }
+                                
                                 info.monthlyBalances.push({
                                     month: month,
                                     points: points,
@@ -371,26 +367,57 @@ class KrogerAPI:
                         }
                     }
                     
-                    // If no cards found, try fallback methods
+                    // Strategy 2: If no large cards found, look for summary sections
                     if (info.monthlyBalances.length === 0) {
-                        // Try basic text patterns as last resort
+                        const summaryElements = document.querySelectorAll('.points-summary, .PointsSummary, [class*="summary"], [class*="Summary"]');
+                        info.debugInfo.foundElements.push(`Found ${summaryElements.length} summary elements`);
+                        
+                        for (const section of summaryElements) {
+                            const text = section.textContent;
+                            // Look for patterns like "November: 1000 points" or "Current: 500 points"
+                            const monthPattern = /(January|February|March|April|May|June|July|August|September|October|November|December|Current|Total)[:\\s]*(\\d{1,6})\\s*points?/gi;
+                            const matches = [...text.matchAll(monthPattern)];
+                            
+                            for (const match of matches) {
+                                const month = match[1];
+                                const points = parseInt(match[2]);
+                                
+                                if (points > 0) {
+                                    info.monthlyBalances.push({
+                                        month: month,
+                                        points: points,
+                                        expiration: ''
+                                    });
+                                    info.totalBalance += points;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Strategy 3: Look for balance-specific content
+                    if (info.monthlyBalances.length === 0) {
                         const allText = document.body.textContent;
-                        const basicPatterns = [
-                            /(\\d+)\\s*Available\\s*Points/i,
-                            /Total[:\\s]*(\\d+)\\s*points?/i,
-                            /Balance[:\\s]*(\\d+)/i
+                        // Only look for very specific balance patterns
+                        const balancePatterns = [
+                            /(?:Available|Current|Total)\\s*Balance[:\\s]*(\\d{1,6})\\s*points?/gi,
+                            /(?:November|December|Current)\\s*(?:Points|Balance)[:\\s]*(\\d{1,6})/gi
                         ];
                         
-                        for (const pattern of basicPatterns) {
-                            const match = allText.match(pattern);
-                            if (match) {
-                                info.totalBalance = parseInt(match[1]);
-                                info.monthlyBalances.push({
-                                    month: 'Current',
-                                    points: parseInt(match[1]),
-                                    expiration: ''
-                                });
-                                break;
+                        for (const pattern of balancePatterns) {
+                            const matches = [...allText.matchAll(pattern)];
+                            if (matches.length > 0 && matches.length <= 3) { // Only if reasonable number of matches
+                                for (const match of matches) {
+                                    const points = parseInt(match[1]);
+                                    if (points > 0) {
+                                        info.monthlyBalances.push({
+                                            month: 'Current',
+                                            points: points,
+                                            expiration: ''
+                                        });
+                                        info.totalBalance += points;
+                                    }
+                                }
+                                break; // Take first working pattern
                             }
                         }
                     }
@@ -398,6 +425,15 @@ class KrogerAPI:
                     return info;
                 }
             ''')
+            
+            # Log debug information
+            if points_info.get('debugInfo'):
+                self.cli.console.print(f'[dim]Page title: {points_info["debugInfo"].get("pageTitle", "N/A")}[/dim]')
+                self.cli.console.print(f'[dim]Current URL: {points_info["debugInfo"].get("url", "N/A")}[/dim]')
+                for msg in points_info['debugInfo']['foundElements']:
+                    self.cli.console.print(f'[dim]{msg}[/dim]')
+                if not points_info.get('monthlyBalances'):
+                    self.cli.console.print(f'[dim]Page text sample: {points_info["debugInfo"]["pageText"][:200]}...[/dim]')
             
             self.cli.console.print(f'[green]Found {len(points_info.get("monthlyBalances", []))} monthly balance(s), total: {points_info.get("totalBalance", 0)} points[/green]')
             
@@ -462,7 +498,7 @@ class KrogerAPI:
             return None
 
         # Wait for page to fully load
-        await self.page.waitFor(3000)
+        await self.page.wait_for_timeout(3000)
         
         # Check if we actually got to a coupons page by looking for coupon-related elements
         try:
@@ -493,7 +529,7 @@ class KrogerAPI:
                 await self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                 
                 # Wait for new content to load
-                await self.page.waitFor(750)  # Wait for lazy loading
+                await self.page.wait_for_timeout(750)  # Wait for lazy loading
                 
                 # Calculate new scroll height and compare with last scroll height
                 new_height = await self.page.evaluate('document.body.scrollHeight')
@@ -507,7 +543,7 @@ class KrogerAPI:
             self.cli.console.print('[blue]Finished loading all coupons, starting to clip...[/blue]')
             
             # Now find all coupon buttons
-            coupon_buttons = await self.page.querySelectorAll('button[data-testid^="CouponActionButton-"]')
+            coupon_buttons = await self.page.query_selector_all('button[data-testid^="CouponActionButton-"]')
             self.cli.console.print(f'[blue]Found {len(coupon_buttons)} total coupon buttons[/blue]')
             
             # First pass: collect all clippable buttons and their test IDs
@@ -562,7 +598,7 @@ class KrogerAPI:
                         
                         # Also check if the button itself shows an error message
                         try:
-                            updated_button = await self.page.querySelector(f'button[data-testid="{testid}"]')
+                            updated_button = await self.page.query_selector(f'button[data-testid="{testid}"]')
                             if updated_button:
                                 button_text = await self.page.evaluate('(element) => element.textContent.trim()', updated_button)
                                 if 'maximum' in button_text.lower():
@@ -602,7 +638,7 @@ class KrogerAPI:
                 for testid, coupon_num in clicked_testids:
                     try:
                         # Find the button again to check its updated state
-                        updated_button = await self.page.querySelector(f'button[data-testid="{testid}"]')
+                        updated_button = await self.page.query_selector(f'button[data-testid="{testid}"]')
                         
                         if updated_button:
                             updated_text = await self.page.evaluate('(element) => element.textContent.trim()', updated_button)
@@ -652,34 +688,76 @@ class KrogerAPI:
 
         return data
 
-    async def init(self):
-        self.browser = await launch(self.browser_options)
-        self.page = await self.browser.newPage()
+    async def init(self, headless=True):
+        """Initialize browser with headless-first approach, fallback to visible if needed"""
+        self.playwright = await async_playwright().start()
         
-        # Hide automation indicators
-        await self.page.evaluateOnNewDocument('''
-            () => {
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                });
-                
-                // Remove automation detection
-                delete navigator.__proto__.webdriver;
-                
-                // Mock plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                
-                // Mock languages
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'],
-                });
-            }
-        ''')
+        # Browser launch options with headless priority
+        browser_args = [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=VizDisplayCompositor',
+            '--no-sandbox',
+            '--disable-dev-shm-usage'
+        ]
         
-        await self.page.setExtraHTTPHeaders(self.headers)
-        await self.page.setViewport({'width': 1366, 'height': 768})  # Common screen resolution
+        try:
+            # Go back to persistent context to maintain authentication
+            if headless:
+                self.cli.console.print("[dim]Trying headless mode first...[/dim]")
+                self.browser = await self.playwright.chromium.launch_persistent_context(
+                    user_data_dir='.user-data',
+                    headless=True,
+                    args=browser_args,
+                    viewport={'width': 1920, 'height': 1080},
+                    extra_http_headers=self.headers
+                )
+            else:
+                # Fallback to visible browser
+                self.cli.console.print("[dim]Using visible browser mode...[/dim]")
+                self.browser = await self.playwright.chromium.launch_persistent_context(
+                    user_data_dir='.user-data',
+                    headless=False,
+                    args=browser_args,
+                    viewport={'width': 1920, 'height': 1080},
+                    extra_http_headers=self.headers
+                )
+            
+            self.page = await self.browser.new_page()
+            
+            # Test JavaScript availability
+            js_test = await self.page.evaluate('() => typeof window !== "undefined" && typeof document !== "undefined"')
+            self.cli.console.print(f"[dim]JavaScript test result: {js_test}[/dim]")
+            
+            # Hide automation indicators
+            await self.page.add_init_script('''
+                () => {
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined,
+                    });
+                    
+                    // Remove automation detection
+                    delete navigator.__proto__.webdriver;
+                    
+                    // Mock plugins
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5],
+                    });
+                    
+                    // Mock languages
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en'],
+                    });
+                }
+            ''')
+            
+        except Exception as e:
+            if headless:
+                self.cli.console.print(f"[yellow]Headless mode failed: {str(e)}[/yellow]")
+                self.cli.console.print("[yellow]Falling back to visible browser...[/yellow]")
+                await self.destroy()
+                return await self.init(headless=False)
+            else:
+                raise e
 
     async def destroy(self):
         try:
@@ -690,22 +768,21 @@ class KrogerAPI:
         
         try:
             if hasattr(self, 'browser') and self.browser:
-                # Properly close browser and all its processes
                 await self.browser.close()
-                # Force kill any remaining processes to prevent atexit errors
-                if hasattr(self.browser, 'process') and self.browser.process:
-                    try:
-                        self.browser.process.kill()
-                    except Exception:
-                        pass
         except Exception:
             pass  # Ignore errors during browser cleanup
+            
+        try:
+            if hasattr(self, 'playwright') and self.playwright:
+                await self.playwright.stop()
+        except Exception:
+            pass  # Ignore errors during playwright cleanup
 
-    async def sign_in_routine(self, redirect_url='/account/update', contains=None):
+    async def sign_in_routine(self, redirect_url='/account/update', contains=None, headless=True):
         if contains is None and redirect_url == '/account/update':
             contains = ['Profile Information']
 
-        await self.init()
+        await self.init(headless=headless)
         
         # First, check if we're already authenticated by trying to access the target page directly
         self.cli.console.print('[italic]Checking for existing authentication...[/italic]')
@@ -713,20 +790,33 @@ class KrogerAPI:
         
         try:
             # Try to navigate directly to the target page
-            await self.page.goto(target_url, {'timeout': 10000})
+            await self.page.goto(target_url, timeout=10000)
             await asyncio.sleep(2)  # Give page time to load
             
             current_url = self.page.url
             page_content = await self.page.content()
             
             # Check if we're actually on the target page (not redirected to login)
-            if current_url.startswith(target_url) or (contains and any(term in page_content for term in contains)):
+            # Be more strict about authentication detection
+            is_authenticated = (
+                current_url.startswith(target_url) and 
+                not 'login' in current_url.lower() and 
+                not 'oauth' in current_url.lower() and
+                not 'signin' in current_url.lower() and
+                (contains is None or any(term in page_content for term in contains))
+            )
+            
+            if is_authenticated:
                 self.cli.console.print('[green]Already authenticated! Skipping login process.[/green]')
                 return True
-            elif 'signin' in current_url.lower() or 'login' in current_url.lower() or 'auth' in current_url.lower():
-                self.cli.console.print('[yellow]Not authenticated, proceeding with login...[/yellow]')
             else:
-                self.cli.console.print(f'[yellow]Unexpected redirect to: {current_url}, will try authentication...[/yellow]')
+                auth_indicators = []
+                if 'login' in current_url.lower(): auth_indicators.append('login URL')
+                if 'oauth' in current_url.lower(): auth_indicators.append('OAuth URL')
+                if 'signin' in current_url.lower(): auth_indicators.append('signin URL')
+                if not current_url.startswith(target_url): auth_indicators.append(f'redirected to {current_url[:100]}...')
+                
+                self.cli.console.print(f'[yellow]Not authenticated ({", ".join(auth_indicators)}), proceeding with login...[/yellow]')
                 
         except Exception as e:
             self.cli.console.print(f'[yellow]Could not check existing authentication: {str(e)}, proceeding with login...[/yellow]')
@@ -736,18 +826,10 @@ class KrogerAPI:
         signed_in = await self.sign_in(redirect_url, contains)
 
         # Only fallback to non-headless if authentication truly failed AND we're in headless mode
-        if not signed_in and self.browser_options['headless']:
+        if not signed_in and headless:
             self.cli.console.print('[red]Sign in failed in headless mode. Trying with browser visible..[/red]')
-            # Save original headless setting
-            original_headless = self.browser_options['headless']
-            try:
-                self.browser_options['headless'] = False
-                await self.destroy()
-                await self.init()
-                signed_in = await self.sign_in(redirect_url, contains)
-            finally:
-                # Always restore original headless setting
-                self.browser_options['headless'] = original_headless
+            await self.destroy()
+            return await self.sign_in_routine(redirect_url, contains, headless=False)
 
         if not signed_in:
             self.cli.console.print('[bold red]Sign in failed. Please make sure the username/password is correct.'
@@ -757,8 +839,7 @@ class KrogerAPI:
 
     async def sign_in(self, redirect_url, contains):
         timeout = 30000  # Increased timeout for complex auth flows
-        if not self.browser_options['headless']:
-            timeout = 60000
+        # Note: no access to headless state here since we're using persistent context
         
         signin_url = 'https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url
         
@@ -769,7 +850,7 @@ class KrogerAPI:
                 self.cli.console.print(f'[blue]Loading signin page: {signin_url}[/blue]')
                 
                 # Use very basic navigation with shorter timeout to avoid infinite hangs
-                await self.page.goto(signin_url, {'timeout': 20000})
+                await self.page.goto(signin_url, timeout=20000)
                 
                 # Wait a bit for any redirects or dynamic content
                 self.cli.console.print('[blue]Waiting for page to fully load...[/blue]')
@@ -842,7 +923,7 @@ class KrogerAPI:
             email_selector = None
             for selector in email_selectors:
                 try:
-                    await self.page.waitForSelector(selector, {'timeout': 2000})
+                    await self.page.wait_for_selector(selector, timeout=2000)
                     email_selector = selector
                     self.cli.console.print(f'[green]Found email field with selector: {selector}[/green]')
                     break
@@ -853,8 +934,8 @@ class KrogerAPI:
                 self.cli.console.print('[red]No email field found[/red]')
                 return False
             
-            await self.page.click(email_selector, {'clickCount': 3})  # Select all in the field
-            await self.page.type(email_selector, self.cli.username)
+            await self.page.click(email_selector, click_count=3)  # Select all in the field
+            await self.page.fill(email_selector, self.cli.username)
             self.cli.console.print('[green]Email entered successfully[/green]')
             
             self.cli.console.print('[blue]Looking for password input field...[/blue]')
@@ -877,7 +958,7 @@ class KrogerAPI:
             password_selector = None
             for selector in password_selectors:
                 try:
-                    await self.page.waitForSelector(selector, {'timeout': 2000})
+                    await self.page.wait_for_selector(selector, timeout=2000)
                     password_selector = selector
                     self.cli.console.print(f'[green]Found password field with selector: {selector}[/green]')
                     break
@@ -888,8 +969,8 @@ class KrogerAPI:
                 self.cli.console.print('[red]No password field found[/red]')
                 return False
             
-            await self.page.click(password_selector, {'clickCount': 3})
-            await self.page.type(password_selector, self.cli.password)
+            await self.page.click(password_selector, click_count=3)
+            await self.page.fill(password_selector, self.cli.password)
             self.cli.console.print('[green]Password entered successfully[/green]')
             
             self.cli.console.print('[blue]Submitting login form...[/blue]')
@@ -910,7 +991,7 @@ class KrogerAPI:
                 submit_clicked = False
                 for selector in submit_selectors:
                     try:
-                        await self.page.waitForSelector(selector, {'timeout': 3000})
+                        await self.page.wait_for_selector(selector, timeout=3000)
                         await self.page.click(selector)
                         self.cli.console.print(f'[green]Clicked submit button: {selector}[/green]')
                         submit_clicked = True
@@ -929,7 +1010,7 @@ class KrogerAPI:
                 await self.page.keyboard.press('Enter')
             
             self.cli.console.print('[blue]Waiting for navigation after login...[/blue]')
-            await self.page.waitForNavigation({'timeout': timeout})
+            await self.page.wait_for_load_state("networkidle", timeout=timeout)
             self.cli.console.print('[green]Navigation completed[/green]')
             
         except Exception as e:
@@ -957,4 +1038,51 @@ class KrogerAPI:
 
     def _get_json_from_page_content(self, content):
         match = re.search('<pre.*?>(.*?)</pre>', content)
-        return json.loads(match[1])
+        if match:
+            return json.loads(match[1])
+        else:
+            # Debug: Let's see what selectors and content we have available
+            self.cli.console.print('[yellow]No <pre> tag found, debugging page content...[/yellow]')
+            
+            # Check for common React/JS data patterns
+            patterns = [
+                r'__INITIAL_STATE__\s*=\s*({.*?});',
+                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+                r'__STATE__\s*=\s*({.*?});',
+                r'window\.initialState\s*=\s*({.*?});',
+                r'"points":\s*(\d+)',
+                r'"balance":\s*(\d+)',
+                r'"totalPoints":\s*(\d+)',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, content, re.DOTALL)
+                if match:
+                    self.cli.console.print(f'[green]Found pattern: {pattern[:50]}...[/green]')
+                    try:
+                        if 'points' in pattern or 'balance' in pattern:
+                            # Simple number extraction
+                            points = int(match.group(1))
+                            return [{}, {
+                                'programDisplayInfo': {'loyaltyProgramName': 'Kroger Fuel Points'},
+                                'programBalance': {'balance': points, 'balanceDescription': f'{points} points'}
+                            }]
+                        else:
+                            # Try to parse as JSON
+                            return json.loads(match.group(1))
+                    except (json.JSONDecodeError, ValueError) as e:
+                        self.cli.console.print(f'[yellow]Could not parse JSON from pattern: {e}[/yellow]')
+                        continue
+            
+            # If no patterns work, let's examine the page structure
+            self.cli.console.print('[yellow]No JSON patterns found, analyzing page structure...[/yellow]')
+            
+            # Look for any mentions of points in the content
+            if 'points' in content.lower():
+                # Find lines containing 'points'
+                lines_with_points = [line.strip() for line in content.split('\n') if 'points' in line.lower()]
+                self.cli.console.print(f'[blue]Found {len(lines_with_points)} lines mentioning points[/blue]')
+                for i, line in enumerate(lines_with_points[:5]):  # Show first 5
+                    self.cli.console.print(f'[dim]{i+1}: {line[:100]}...[/dim]')
+            
+            return None
