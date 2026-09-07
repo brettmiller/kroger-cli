@@ -1,6 +1,8 @@
 Kroger CLI
 ==========
 
+## This never worked correctly. Wrote a complete new tool that just does clipping/unclipping - [kroger-clipper-cli](https://github.com/brettmiller/kroger-clipper-cli)
+
 #### This fork refactors to: use a newer python3, work with the current Kroger site (as of 2025-11), removes the survey option since it's no longer available.
 ###### *The purchases summary doesn't work b/c the site changed it is over multiple pages, it may be removed, simplified, or may be fixed 🤷
 
